@@ -231,7 +231,7 @@ async function readLoop() {
           parseCSV(csv);
           collecting = false; csvBuf = '';
         }
-      }
+      } 
     }
   } catch(e){ console.log('Reader stopped:', e); }
 }
