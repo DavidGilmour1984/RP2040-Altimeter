@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>RP2040 Altitude Logger – Graph & Trim</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root { --card:#fff; --bg:#f5f5f5; --text:#111; --accent:#0a84ff; }
+  body{font-family:Helvetica,Arial,sans-serif;background:var(--bg);margin:0;padding:24px;color:var(--text)}
+  .wrap{max-width:1100px;margin:auto}
+  .card{background:var(--card);border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:18px;margin-bottom:18px}
+  h1{margin:0 0 8px;font-size:24px}
+  .row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+  button{border:0;background:var(--accent);color:#fff;padding:10px 14px;border-radius:10px;cursor:pointer;font-size:14px}
+  button.secondary{background:#444}
+  button.danger{background:#c62828}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  #status{font-size:14px;opacity:.8}
+  textarea{width:100%;height:220px;font-family:ui-monospace,Consolas,monospace;font-size:13px;border-radius:10px;border:1px solid #d0d0d0;padding:10px;box-sizing:border-box}
+  .pill{padding:4px 10px;border-radius:999px;background:#eee;font-size:12px}
+  .controls{display:grid;grid-template-columns: 1fr 1fr; gap:12px; align-items:center}
+  .controls label{font-size:14px; opacity:.9}
+  .range-row{display:flex; gap:10px; align-items:center}
+  input[type="range"]{width:100%}
+  #chartWrap{height:420px}
+  #chart{width:100%; height:100%}
+  .muted{opacity:.75}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>RP2040 Altitude Logger – Web Serial + Graph</h1>
+    <div class="row">
+      <button id="btnConnect">Connect</button>
+      <button id="btnDisconnect" class="secondary" disabled>Disconnect</button>
+      <span id="status" class="pill">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <button id="btnGet">Get Data (DUMP)</button>
+      <button id="btnClear" class="danger">Clear Data (CLEAR)</button>
+      <button id="btnSave" class="secondary">Save CSV</button>
+      <button id="btnStatus" class="secondary">STATUS</button>
+      <span id="info" class="pill">samples: 0</span>
+    </div>
+
+    <div id="chartWrap">
+      <canvas id="chart"></canvas>
+    </div>
+
+    <div class="controls" style="margin-top:14px">
+      <div>
+        <div class="range-row">
+          <label for="startPct">Start %</label>
+          <input id="startPct" type="range" min="0" max="99" step="1" value="0">
+          <span id="startVal" class="pill">0%</span>
+        </div>
+        <div class="muted" id="startTime">Start t = 0.00 s</div>
+      </div>
+      <div>
+        <div class="range-row">
+          <label for="endPct">End %</label>
+          <input id="endPct" type="range" min="1" max="100" step="1" value="100">
+          <span id="endVal" class="pill">100%</span>
+        </div>
+        <div class="muted" id="endTime">End t = 0.00 s</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:8px" class="muted">Raw CSV captured between <code>[BEGIN_CSV]</code> and <code>[END_CSV]</code></div>
+    <textarea id="log" placeholder="CSV output will appear here..."></textarea>
+  </div>
+</div>
+
+<script>
+let port, reader, writer;
+let keepReading = false;
+let textDecoder, readableStreamClosed;
+
+// Full parsed data
+let fullTimes = [];  // seconds
+let fullAlts  = [];  // meters
+
+// Current slice [startIdx, endIdx)
+let startPctEl = document.getElementById('startPct');
+let endPctEl   = document.getElementById('endPct');
+let startValEl = document.getElementById('startVal');
+let endValEl   = document.getElementById('endVal');
+let startTimeEl= document.getElementById('startTime');
+let endTimeEl  = document.getElementById('endTime');
+
+const els = {
+  connect:    document.getElementById('btnConnect'),
+  disconnect: document.getElementById('btnDisconnect'),
+  get:        document.getElementById('btnGet'),
+  clear:      document.getElementById('btnClear'),
+  save:       document.getElementById('btnSave'),
+  status:     document.getElementById('status'),
+  txt:        document.getElementById('log'),
+  statBtn:    document.getElementById('btnStatus'),
+  info:       document.getElementById('info'),
+  chartCanvas:document.getElementById('chart')
+};
+
+function setConnectedUI(connected) {
+  els.connect.disabled = connected;
+  els.disconnect.disabled = !connected;
+  els.get.disabled = !connected;
+  els.clear.disabled = !connected;
+  els.status.textContent = connected ? 'Connected' : 'Disconnected';
+  // Save works even when disconnected (uses textarea contents)
+  els.save.disabled = false;
+  els.statBtn.disabled = !connected;
+}
+
+// ---------- Chart.js setup ----------
+const ctx = els.chartCanvas.getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: [],             // time (s)
+    datasets: [{
+      label: 'Altitude (m)',
+      data: [],             // altitude data
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0            // straight lines
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    scales: {
+      x: { title: { display: true, text: 'Time (s)' } },
+      y: { title: { display: true, text: 'Altitude (m)' } }
+    },
+    plugins: {
+      legend: { display: false }
+    }
+  }
+});
+
+function updateSliceFromPercents() {
+  if (!fullTimes.length) return;
+  // Ensure start < end
+  let startPct = parseInt(startPctEl.value, 10);
+  let endPct   = parseInt(endPctEl.value, 10);
+  if (endPct <= startPct) endPct = Math.min(100, startPct + 1);
+  endPctEl.value = endPct;
+
+  startValEl.textContent = startPct + '%';
+  endValEl.textContent   = endPct   + '%';
+
+  const n = fullTimes.length;
+  const startIdx = Math.floor(n * (startPct/100));
+  const endIdx   = Math.ceil(n * (endPct/100));
+  const visibleTimes = fullTimes.slice(startIdx, endIdx);
+  const visibleAlts  = fullAlts.slice(startIdx, endIdx);
+
+  chart.data.labels = visibleTimes;
+  chart.data.datasets[0].data = visibleAlts;
+  chart.update();
+
+  // Update time labels
+  const st = visibleTimes.length ? visibleTimes[0] : 0;
+  const et = visibleTimes.length ? visibleTimes[visibleTimes.length - 1] : 0;
+  startTimeEl.textContent = `Start t = ${st.toFixed(2)} s`;
+  endTimeEl.textContent   = `End t = ${et.toFixed(2)} s`;
+}
+
+startPctEl.addEventListener('input', updateSliceFromPercents);
+endPctEl.addEventListener('input', updateSliceFromPercents);
+
+// ---------- Web Serial ----------
+async function connect() {
+  try {
+    port = await navigator.serial.requestPort({});
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+
+    textDecoder = new TextDecoderStream();
+    readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+    reader = textDecoder.readable.getReader();
+
+    keepReading = true;
+    readLoop();
+
+    setConnectedUI(true);
+  } catch (e) {
+    console.error(e);
+    alert('Failed to connect: ' + e);
+  }
+}
+
+async function disconnect() {
+  try {
+    keepReading = false;
+    if (reader) { await reader.cancel(); await readableStreamClosed.catch(()=>{}); reader = null; }
+    if (writer) { writer.releaseLock(); writer = null; }
+    if (port)   { await port.close(); port = null; }
+  } catch (e) {
+    console.error(e);
+  } finally {
+    setConnectedUI(false);
+  }
+}
+
+async function readLoop() {
+  let collecting = false;
+  let csvBuf = '';
+  try {
+    while (keepReading) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        let chunk = value;
+
+        // STATUS parser (optional)
+        const m = chunk.match(/samples=(\d+)/);
+        if (m) els.info.textContent = 'samples: ' + m[1];
+
+        // CSV frame collection
+        if (chunk.includes('[BEGIN_CSV]')) {
+          collecting = true;
+          csvBuf = '';
+          chunk = chunk.slice(chunk.indexOf('[BEGIN_CSV]') + '[BEGIN_CSV]'.length);
+        }
+        if (collecting) csvBuf += chunk;
+        if (chunk.includes('[END_CSV]')) {
+          const endIdx = csvBuf.indexOf('[END_CSV]');
+          const csv = csvBuf.slice(0, endIdx).trim().replace(/^\s+/, '');
+          els.txt.value = csv;  // show raw CSV
+
+          // Parse CSV -> arrays
+          parseCSV(csv);
+          // Reset sliders to full range
+          startPctEl.value = 0;
+          endPctEl.value = 100;
+          updateSliceFromPercents();
+
+          // Reset collection
+          collecting = false;
+          csvBuf = '';
+        }
+      }
+    }
+  } catch (e) {
+    console.log('Reader stopped:', e);
+  }
+}
+
+function parseCSV(csv) {
+  fullTimes = [];
+  fullAlts  = [];
+  const lines = csv.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  for (let i=0; i<lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    if (i === 0 && line.toLowerCase().includes('time') && line.includes('alt')) {
+      // skip header
+      continue;
+    }
+    const parts = line.split(',').map(s => s.trim());
+    if (parts.length < 2) continue;
+    const t = parseFloat(parts[0]);
+    const a = parseFloat(parts[1]);
+    if (Number.isFinite(t) && Number.isFinite(a)) {
+      fullTimes.push(t);
+      fullAlts.push(a);
+    }
+  }
+}
+
+async function sendLine(s) {
+  if (!writer) return;
+  const data = new TextEncoder().encode(s + '\n');
+  await writer.write(data);
+}
+
+// ---------- UI hooks ----------
+els.connect.onclick = connect;
+els.disconnect.onclick = disconnect;
+els.status.textContent = 'Disconnected';
+
+els.get.onclick = async () => { await sendLine('DUMP'); };
+els.clear.onclick = async () => { await sendLine('CLEAR'); };
+document.getElementById('btnStatus').onclick = async () => { await sendLine('STATUS'); };
+
+els.save.onclick = () => {
+  const blob = new Blob([els.txt.value], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+  a.download = `rp2040_altitude_${stamp}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+// Feature check
+if (!('serial' in navigator)) {
+  alert('This browser does not support Web Serial. Use Chrome or Edge.');
+}
+</script>
+</body>
+</html>
