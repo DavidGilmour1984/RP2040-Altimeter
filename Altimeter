@@ -1,0 +1,187 @@
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_NeoPixel.h>
+
+// --------- Pins (RP2040 GPIO numbers) ---------
+#define I2C_SDA_PIN        4       // GP4
+#define I2C_SCL_PIN        5       // GP5
+#define LOG_LEVEL_PIN     14       // D14: LOW = log, HIGH = idle (level-controlled)
+#define NEOPIXEL_PIN      16       // Waveshare RP2040 Zero onboard NeoPixel
+#define NUMPIXELS          1
+
+// --------- BMP280 Settings ---------
+#define BMP_ADDR         0x76
+#define SEA_LEVEL_HPA    1013.25f
+
+// --------- Logging Buffer ---------
+struct LogEntry {
+  float t;    // seconds since start of current logging session
+  float alt;  // altitude (m) relative to baseline at session start
+};
+
+// Tweak as you like. 5000 @ 20 Hz ≈ 250 s (~4.2 min) of data.
+// Each entry ~8 bytes => 5000 ≈ 40 KB of RAM.
+#define MAX_SAMPLES   5000
+#define SAMPLE_MS     50      // 20 Hz
+#define ZERO_SAMPLES  50      // average for baseline
+
+Adafruit_BMP280 bmp;
+Adafruit_NeoPixel pixel(NUMPIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+LogEntry logBuffer[MAX_SAMPLES];
+volatile uint16_t logCount = 0;
+
+bool loggingActive = false;
+unsigned long t0 = 0;
+float alt0 = 0.0f;
+
+static bool lastLogPinState = HIGH;  // pull-up idle HIGH
+
+// ---------- NeoPixel helpers ----------
+static inline void led(uint8_t r, uint8_t g, uint8_t b) {
+  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  pixel.show();
+}
+
+static inline void led_idle()   { led(0, 0, 255); }     // Blue
+static inline void led_log()    { led(0, 255, 0); }     // Green
+static inline void led_blink()  { led(0, 50, 0); }      // Dim-green blink per sample
+static inline void led_dump()   { led(255, 255, 0); }   // Yellow
+static inline void led_clear()  { led(255, 0, 0); }     // Red
+static inline void led_error()  { led(255, 0, 128); }   // Magenta for sensor error
+
+// ---------- Serial command handling ----------
+char cmdBuf[32];
+uint8_t cmdLen = 0;
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      cmdBuf[cmdLen] = '\0';
+      if (cmdLen) {
+        // Process command
+        if (!strcasecmp(cmdBuf, "DUMP")) {
+          // Dump buffer as CSV once
+          led_dump();
+          Serial.println(F("[BEGIN_CSV]"));
+          Serial.println(F("time_s,alt_m"));
+          for (uint16_t i = 0; i < logCount; i++) {
+            Serial.print(logBuffer[i].t, 2);
+            Serial.print(',');
+            Serial.println(logBuffer[i].alt, 2);
+          }
+          Serial.println(F("[END_CSV]"));
+          Serial.flush();
+          // Restore LED to state
+          if (loggingActive) led_log(); else led_idle();
+        } else if (!strcasecmp(cmdBuf, "CLEAR")) {
+          // Clear buffer once
+          logCount = 0;
+          led_clear();
+          delay(150);
+          if (loggingActive) {
+            t0 = millis();  // fresh timebase for ongoing session
+            led_log();
+          } else {
+            led_idle();
+          }
+        } else if (!strcasecmp(cmdBuf, "STATUS")) {
+          Serial.print(F("loggingActive="));
+          Serial.print(loggingActive ? "1" : "0");
+          Serial.print(F(", samples="));
+          Serial.println(logCount);
+        } else {
+          // Unknown → echo help
+          Serial.println(F("OK CMDS: DUMP | CLEAR | STATUS"));
+        }
+      }
+      cmdLen = 0;
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+}
+
+// ---------- Setup ----------
+void setup() {
+  pinMode(LOG_LEVEL_PIN, INPUT_PULLUP);
+
+  Serial.begin(115200);
+
+  pixel.begin();
+  pixel.setBrightness(100);
+  led_idle();
+
+  Wire.setSDA(I2C_SDA_PIN);
+  Wire.setSCL(I2C_SCL_PIN);
+  Wire.begin();
+
+  if (!bmp.begin(BMP_ADDR)) {
+    // Sensor not found → keep running so you can still test serial/HTML UI
+    led_error();
+    delay(400);
+    led_idle();
+  } else {
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X2,    // temp
+                    Adafruit_BMP280::SAMPLING_X16,   // pressure
+                    Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_63);
+  }
+
+  lastLogPinState = digitalRead(LOG_LEVEL_PIN);
+}
+
+// ---------- Loop ----------
+void loop() {
+  // Handle Web Serial commands at all times
+  handleSerial();
+
+  // Level-controlled logging via D14
+  bool logPin = digitalRead(LOG_LEVEL_PIN);
+  if (logPin != lastLogPinState) {
+    // debounce the change
+    delay(20);
+    if (digitalRead(LOG_LEVEL_PIN) == logPin) {
+      // Transition detected after debounce
+      if (logPin == LOW && !loggingActive) {
+        // Start a logging session: zero baseline
+        float sum = 0.0f;
+        for (int i = 0; i < ZERO_SAMPLES; i++) {
+          sum += bmp.readAltitude(SEA_LEVEL_HPA);
+          delay(2);
+        }
+        alt0 = sum / ZERO_SAMPLES;
+        t0 = millis();
+        loggingActive = true;
+        led_log();
+      } else if (logPin == HIGH && loggingActive) {
+        // Stop logging, go idle
+        loggingActive = false;
+        led_idle();
+      }
+      lastLogPinState = logPin;
+    }
+  }
+
+  // Sample at 20 Hz while logging
+  static unsigned long lastSample = 0;
+  if (loggingActive && (millis() - lastSample >= SAMPLE_MS)) {
+    lastSample = millis();
+    if (logCount < MAX_SAMPLES) {
+      float alt = bmp.readAltitude(SEA_LEVEL_HPA) - alt0;
+      float t   = (millis() - t0) / 1000.0f;
+
+      logBuffer[logCount].t   = t;
+      logBuffer[logCount].alt = alt;
+      logCount++;
+
+      // brief blink to show sampling activity
+      led_blink();
+      delay(3);
+      led_log();
+    }
+  }
+}
