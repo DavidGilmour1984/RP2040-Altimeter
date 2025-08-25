@@ -2,84 +2,145 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>RP2040 Altitude Logger – Flights & Graph</title>
+<title>RP2040 Altitude – Mission Console</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
 <style>
-  :root { --card:#fff; --bg:#f5f5f5; --text:#111; --accent:#0a84ff; }
-  body{font-family:Helvetica,Arial,sans-serif;background:var(--bg);margin:0;padding:24px;color:var(--text)}
-  .wrap{max-width:1100px;margin:auto}
-  .card{background:var(--card);border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:18px;margin-bottom:18px}
-  h1{margin:0 0 8px;font-size:24px}
-  .row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
-  button{border:0;background:var(--accent);color:#fff;padding:10px 14px;border-radius:10px;cursor:pointer;font-size:14px}
-  button.secondary{background:#444}
-  button.danger{background:#c62828}
+  :root{
+    --bg:#0c0f13; --panel:#141922; --panel2:#0f141c; --text:#eaf6ff;
+    --accent:#00e5ff; --accent2:#00ff9c; --danger:#ff445a; --muted:#8aa0b2; --grid:#223041;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 Inter,system-ui,Segoe UI,Roboto,Arial}
+  .wrap{max-width:1280px;margin:auto;padding:22px}
+  h1{margin:0 0 10px;font-size:20px;letter-spacing:.5px;color:#dff8ff}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid #1f2a38;border-radius:14px;padding:14px;margin-bottom:16px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+
+  button{
+    border:1px solid #1f2a38;background:#13202b;color:var(--text);padding:10px 14px;border-radius:10px;
+    cursor:pointer;font-weight:600;letter-spacing:.2px;box-shadow:0 0 0 1px rgba(0,229,255,.05) inset, 0 8px 20px rgba(0,0,0,.25)
+  }
+  button.primary{background:linear-gradient(180deg,#0aa6c0,#087b8f);border-color:#0da8c4}
+  button.secondary{background:#2a3443}
+  button.danger{background:linear-gradient(180deg,#ff5b73,#cf2d40);border-color:#ff5b73}
   button:disabled{opacity:.5;cursor:not-allowed}
-  #status{font-size:14px;opacity:.8}
-  textarea{width:100%;height:220px;font-family:ui-monospace,Consolas,monospace;font-size:13px;border-radius:10px;border:1px solid #d0d0d0;padding:10px;box-sizing:border-box}
-  .pill{padding:4px 10px;border-radius:999px;background:#eee;font-size:12px}
-  .controls{display:grid;grid-template-columns: 1fr 1fr; gap:12px; align-items:center}
-  .controls label{font-size:14px; opacity:.9}
-  .range-row{display:flex; gap:10px; align-items:center}
+  input, select{
+    background:#101722;border:1px solid #283445;border-radius:10px;color:var(--text);padding:8px 10px
+  }
+  .pill{padding:5px 10px;border-radius:999px;background:#1a2633;border:1px solid #2b394b;color:#b9d4e6}
+  .panel-title{font-size:13px;letter-spacing:.35px;color:#b4d0df;text-transform:uppercase}
+
+  .grid{
+    display:grid;grid-template-columns: 1.6fr 0.9fr;gap:14px
+  }
+  @media (max-width: 1000px){ .grid{grid-template-columns:1fr} }
+
+  #chartWrap{
+    height:460px;border-radius:12px;border:1px solid #1f2a38;background:#0c131b;display:flex;align-items:center;justify-content:center;padding:10px
+  }
+  #chart{width:100%;height:100%}
+
+  .tableCard{border:1px dashed #234055;border-radius:12px;padding:12px;background:#0b121a}
+  .tableCard h3{margin:0 0 8px}
+  table{width:100%;border-collapse:separate;border-spacing:0 8px}
+  td{padding:4px 6px}
+  td.label{color:#9fb3c4}
+  td.value{font-weight:700}
+
+  .controls{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:12px}
+  .range-row{display:flex;gap:10px;align-items:center}
   input[type="range"]{width:100%}
-  #chartWrap{height:420px}
-  #chart{width:100%; height:100%}
-  .muted{opacity:.75}
+
+  textarea{width:100%;height:220px;border-radius:10px;border:1px solid #1f2a38;background:#0c131b;color:#cfe8ff;font-family:ui-monospace,Consolas,monospace}
+
+  /* memory gauge */
+  .mem{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .bar{flex:1;height:12px;background:#0b121a;border:1px solid #243343;border-radius:999px;overflow:hidden}
+  .bar > span{display:block;height:100%;background:linear-gradient(90deg,#00d6ff,#00ff9c);width:0%}
+  .mem small{color:#8eb2c6}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="card">
-    <h1>RP2040 Altitude Logger – Web Serial + Multi-Flight</h1>
+    <h1>STP Altimeter – Mission Console</h1>
     <div class="row">
-      <button id="btnConnect">Connect</button>
+      <button id="btnConnect" class="primary">Connect</button>
       <button id="btnDisconnect" class="secondary" disabled>Disconnect</button>
-      <span id="status" class="pill">Disconnected</span>
+
+      <span class="pill">USB: <b id="status">Disconnected</b></span>
+
+      <div class="mem" style="min-width:320px;flex:1">
+        <span class="panel-title">Flash usage</span>
+        <div class="bar"><span id="memFill"></span></div>
+        <small id="memLabel">0 / 1.00 MB (0%)</small>
+        <!-- FS size input removed safely -->
+      </div>
     </div>
   </div>
 
   <div class="card">
-    <div class="row" style="margin-bottom:10px">
-      <button id="btnGet">Get Data (DUMP)</button>
-      <button id="btnClear" class="danger">Clear Data (CLEAR)</button>
-      <button id="btnSave" class="secondary">Save CSV</button>
+    <div class="row" style="margin-bottom:8px">
+      <button id="btnGet"  class="primary">Download Data from Altimeter</button>
+      <button id="btnSaveXlsx" class="secondary">Save XLSX</button>
+      <button id="btnSavePdf" class="secondary">Save PDF</button>
       <button id="btnStatus" class="secondary">STATUS</button>
-      <span id="info" class="pill">samples: 0</span>
+      <span class="pill">bytes: <b id="bytesVal">0</b></span>
+      <button id="btnClear" class="danger">Erase Altimeter Data</button>
     </div>
 
-    <div class="row" style="margin-bottom:10px">
-      <label for="flightSelect">Select Flight:</label>
+    <div class="row" style="gap:14px;margin-bottom:10px">
+      <label class="panel-title">Select Flight:</label>
       <select id="flightSelect"></select>
+      <input id="flightName" placeholder="Flight Name (optional)" style="min-width:220px" />
+      <span id="flightNameBadge" class="pill">—</span>
     </div>
 
-    <div id="chartWrap">
-      <canvas id="chart"></canvas>
+    <div class="grid" id="exportRegion">
+      <div id="chartWrap"><canvas id="chart"></canvas></div>
+      <div class="tableCard" id="metrics">
+        <h3>Flight Metrics </h3>
+        <h3>(Launch Detect Threshold > 2 m)</h3>
+        <table>
+          <tr><td class="label">Time of flight</td><td class="value" id="m_flightTime">—</td></tr>
+          <tr><td class="label">Apogee</td><td class="value" id="m_apogee">—</td></tr>
+          <tr><td class="label">Time to apogee</td><td class="value" id="m_timeToApogee">—</td></tr>
+          <tr><td class="label">Descent time</td><td class="value" id="m_descentTime">—</td></tr>
+          <tr><td class="label">Avg ascent speed</td><td class="value" id="m_avgAsc">—</td></tr>
+          <tr><td class="label">Peak ascent speed</td><td class="value" id="m_maxAsc">—</td></tr>
+          <tr><td class="label">Avg descent speed</td><td class="value" id="m_avgDesc">—</td></tr>
+          <tr><td class="label">Peak descent speed</td><td class="value" id="m_maxDesc">—</td></tr>
+        </table>
+      </div>
     </div>
 
-    <div class="controls" style="margin-top:14px">
+    <div class="controls">
       <div>
         <div class="range-row">
-          <label for="startPct">Start %</label>
+          <span class="panel-title">Start %</span>
           <input id="startPct" type="range" min="0" max="99" step="1" value="0">
           <span id="startVal" class="pill">0%</span>
         </div>
-        <div class="muted" id="startTime">Start t = 0.00 s</div>
+        <div id="startTime" class="pill">Start t = 0.00 s</div>
       </div>
       <div>
         <div class="range-row">
-          <label for="endPct">End %</label>
+          <span class="panel-title">End %</span>
           <input id="endPct" type="range" min="1" max="100" step="1" value="100">
           <span id="endVal" class="pill">100%</span>
         </div>
-        <div class="muted" id="endTime">End t = 0.00 s</div>
+        <div id="endTime" class="pill">End t = 0.00 s</div>
       </div>
     </div>
   </div>
 
   <div class="card">
-    <div style="margin-bottom:8px" class="muted">Raw CSV captured between <code>[BEGIN_CSV]</code> and <code>[END_CSV]</code></div>
-    <textarea id="log" placeholder="CSV output will appear here..."></textarea>
+    <div class="panel-title" style="margin-bottom:8px">Raw CSV (between [BEGIN_CSV] and [END_CSV])</div>
+    <textarea id="log" placeholder="CSV output appears here after DUMP…"></textarea>
   </div>
 </div>
 
@@ -88,178 +149,366 @@ let port, reader, writer;
 let keepReading = false;
 let textDecoder, readableStreamClosed;
 
-// Flights array
-let flights = [];  // array of {id: n, times: [], alts: []}
+let flights = [];  // [{ id:n, times:[], alts:[] }]
 let currentFlight = null;
 
-// Slider elements
-let startPctEl = document.getElementById('startPct');
-let endPctEl   = document.getElementById('endPct');
-let startValEl = document.getElementById('startVal');
-let endValEl   = document.getElementById('endVal');
-let startTimeEl= document.getElementById('startTime');
-let endTimeEl  = document.getElementById('endTime');
+let bytesUsed = 0;
 
-// UI elements
+// UI refs
 const els = {
   connect:    document.getElementById('btnConnect'),
   disconnect: document.getElementById('btnDisconnect'),
   get:        document.getElementById('btnGet'),
   clear:      document.getElementById('btnClear'),
-  save:       document.getElementById('btnSave'),
-  status:     document.getElementById('status'),
-  txt:        document.getElementById('log'),
-  statBtn:    document.getElementById('btnStatus'),
-  info:       document.getElementById('info'),
+  saveXlsx:   document.getElementById('btnSaveXlsx'),
+  savePdf:    document.getElementById('btnSavePdf'),
+  statusBtn:  document.getElementById('btnStatus'),
+  statusLbl:  document.getElementById('status'),
   chartCanvas:document.getElementById('chart'),
-  flightSel:  document.getElementById('flightSelect')
+  txt:        document.getElementById('log'),
+  flightSel:  document.getElementById('flightSelect'),
+  flightName: document.getElementById('flightName'),
+  flightNameBadge: document.getElementById('flightNameBadge'),
+  startPct:   document.getElementById('startPct'),
+  endPct:     document.getElementById('endPct'),
+  startVal:   document.getElementById('startVal'),
+  endVal:     document.getElementById('endVal'),
+  startTime:  document.getElementById('startTime'),
+  endTime:    document.getElementById('endTime'),
+  m_flightTime: document.getElementById('m_flightTime'),
+  m_apogee:     document.getElementById('m_apogee'),
+  m_timeToApogee: document.getElementById('m_timeToApogee'),
+  m_descentTime: document.getElementById('m_descentTime'),
+  m_avgAsc:    document.getElementById('m_avgAsc'),
+  m_maxAsc:    document.getElementById('m_maxAsc'),
+  m_avgDesc:   document.getElementById('m_avgDesc'),
+  m_maxDesc:   document.getElementById('m_maxDesc'),
+  memFill:    document.getElementById('memFill'),
+  memLabel:   document.getElementById('memLabel'),
+  bytesVal:   document.getElementById('bytesVal'),
+  exportRegion:document.getElementById('exportRegion')
 };
 
-// ---------- Chart.js setup ----------
+// ------------- Chart (dark) -------------
 const ctx = els.chartCanvas.getContext('2d');
 const chart = new Chart(ctx, {
   type: 'line',
-  data: { labels: [], datasets: [{ label: 'Altitude (m)', data: [], borderWidth: 2, pointRadius: 0, tension: 0 }] },
+  data: { labels: [], datasets: [{
+    label: 'Altitude (m)',
+    data: [],
+    borderWidth: 2,
+    pointRadius: 0,
+    tension: 0,
+    borderColor: '#00e5ff'
+  }]},
   options: {
     responsive: true, maintainAspectRatio: false, animation: false,
-    scales: { x: { title: { display: true, text: 'Time (s)' } }, y: { title: { display: true, text: 'Altitude (m)' } } },
-    plugins: { legend: { display: false } }
+    scales: {
+      x: {
+        title: { display:true, text:'Time (s)', color:'#b6d5e6' },
+        ticks: { color:'#9fb3c4' }, grid: { color:'#1b2836' }
+      },
+      y: {
+        title: { display:true, text:'Altitude (m)', color:'#b6d5e6' },
+        ticks: { color:'#9fb3c4' }, grid: { color:'#1b2836' }
+      }
+    },
+    plugins: { legend:{ labels:{ color:'#cfe8ff' } } }
   }
 });
 
-function updateSliceFromPercents() {
-  if (!currentFlight) return;
-  let startPct = parseInt(startPctEl.value, 10);
-  let endPct   = parseInt(endPctEl.value, 10);
-  if (endPct <= startPct) endPct = Math.min(100, startPct + 1);
-  endPctEl.value = endPct;
-  startValEl.textContent = startPct + '%';
-  endValEl.textContent   = endPct   + '%';
-
-  const n = currentFlight.times.length;
-  const startIdx = Math.floor(n * (startPct/100));
-  const endIdx   = Math.ceil(n * (endPct/100));
-  const visibleTimes = currentFlight.times.slice(startIdx, endIdx);
-  const visibleAlts  = currentFlight.alts.slice(startIdx, endIdx);
-
-  chart.data.labels = visibleTimes;
-  chart.data.datasets[0].data = visibleAlts;
-  chart.update();
-
-  const st = visibleTimes.length ? visibleTimes[0] : 0;
-  const et = visibleTimes.length ? visibleTimes[visibleTimes.length-1] : 0;
-  startTimeEl.textContent = `Start t = ${st.toFixed(2)} s`;
-  endTimeEl.textContent   = `End t = ${et.toFixed(2)} s`;
+// ------------- Memory gauge -------------
+function updateMemoryUI() {
+  const fsMB = 1; // fixed size
+  const total = fsMB * 1024 * 1024;
+  const used = Math.max(0, bytesUsed);
+  const pct  = Math.min(100, (used / total) * 100);
+  els.memFill.style.width = pct.toFixed(1) + '%';
+  els.memLabel.textContent = `${(used/1048576).toFixed(2)} / ${fsMB.toFixed(2)} MB (${pct.toFixed(1)}%)`;
+  els.bytesVal.textContent = used;
 }
 
-startPctEl.addEventListener('input', updateSliceFromPercents);
-endPctEl.addEventListener('input', updateSliceFromPercents);
-
-// ---------- CSV parser ----------
-function parseCSV(csv) {
-  flights = [];
-  currentFlight = null;
-  const lines = csv.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  for (let line of lines) {
-    if (line.startsWith("FLIGHT,")) {
-      const n = parseInt(line.split(",")[1]);
-      currentFlight = {id:n, times:[], alts:[]};
-      flights.push(currentFlight);
-      continue;
-    }
-    if (line.toLowerCase().includes("time") && line.includes("alt")) continue;
-    const parts = line.split(",");
-    if (parts.length < 2 || !currentFlight) continue;
-    const t = parseFloat(parts[0]);
-    const a = parseFloat(parts[1]);
-    if (Number.isFinite(t) && Number.isFinite(a)) {
-      currentFlight.times.push(t);
-      currentFlight.alts.push(a);
-    }
-  }
-  // populate dropdown
-  els.flightSel.innerHTML = flights.map(f=>`<option value="${f.id}">Flight ${f.id}</option>`).join("");
-  if (flights.length) showFlight(flights[flights.length-1].id);
-}
-
-function showFlight(id) {
-  currentFlight = flights.find(fl => fl.id == id);
-  if (!currentFlight) return;
-  startPctEl.value = 0; endPctEl.value = 100;
-  updateSliceFromPercents();
-}
-
-els.flightSel.addEventListener("change", e => showFlight(e.target.value));
-
-// ---------- Web Serial ----------
-async function connect() {
-  try {
-    port = await navigator.serial.requestPort({});
-    await port.open({ baudRate: 115200 });
-    writer = port.writable.getWriter();
-    textDecoder = new TextDecoderStream();
-    readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
-    reader = textDecoder.readable.getReader();
-    keepReading = true; readLoop();
-    setConnectedUI(true);
-  } catch (e) { alert('Failed to connect: ' + e); }
-}
-async function disconnect() {
-  try {
-    keepReading = false;
-    if (reader) { await reader.cancel(); await readableStreamClosed.catch(()=>{}); reader = null; }
-    if (writer) { writer.releaseLock(); writer = null; }
-    if (port)   { await port.close(); port = null; }
-  } finally { setConnectedUI(false); }
-}
-async function readLoop() {
-  let collecting = false, csvBuf = '';
-  try {
-    while (keepReading) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) {
-        let chunk = value;
-        const m = chunk.match(/bytes=(\d+)/);
-        if (m) els.info.textContent = 'bytes: ' + m[1];
-        if (chunk.includes('[BEGIN_CSV]')) { collecting = true; csvBuf = ''; chunk = chunk.slice(chunk.indexOf('[BEGIN_CSV]')+11); }
-        if (collecting) csvBuf += chunk;
-        if (chunk.includes('[END_CSV]')) {
-          const endIdx = csvBuf.indexOf('[END_CSV]');
-          const csv = csvBuf.slice(0, endIdx).trim().replace(/^\s+/, '');
-          els.txt.value = csv;
-          parseCSV(csv);
-          collecting = false; csvBuf = '';
-        }
-      } 
-    }
-  } catch(e){ console.log('Reader stopped:', e); }
-}
-async function sendLine(s) { if (writer) await writer.write(new TextEncoder().encode(s+'\n')); }
-
-// ---------- UI hooks ----------
+// ------------- Helpers -------------
 function setConnectedUI(connected) {
   els.connect.disabled = connected;
   els.disconnect.disabled = !connected;
   els.get.disabled = !connected;
   els.clear.disabled = !connected;
-  els.status.textContent = connected ? 'Connected' : 'Disconnected';
-  els.save.disabled = false; els.statBtn.disabled = !connected;
+  els.statusBtn.disabled = !connected;
+  els.statusLbl.textContent = connected ? 'Connected' : 'Disconnected';
+  els.saveXlsx.disabled = false;
+  els.savePdf.disabled  = false;
 }
+
+function fmtS(x){return isFinite(x)? `${x.toFixed(2)} s` : '—';}
+function fmtM(x){return isFinite(x)? `${x.toFixed(2)} m` : '—';}
+function fmtV(x){return isFinite(x)? `${x.toFixed(2)} m/s` : '—';}
+
+// ------------- Metrics using 2 m threshold -------------
+const THRESH=2.0; // meters
+function updateMetricsFromSlice(times, alts){
+  if (!times.length){ setMetrics(null); return; }
+
+  const startIdx = alts.findIndex(a=>a>THRESH);
+  let endIdx = -1; for(let i=alts.length-1;i>=0;i--){ if (alts[i]>THRESH){ endIdx=i; break; } }
+
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx){
+    setMetrics(null); return;
+  }
+
+  const T = times.slice(startIdx, endIdx+1);
+  const A = alts.slice(startIdx, endIdx+1);
+
+  // apogee within the active segment
+  let maxAlt = -Infinity, k=0;
+  for (let i=0;i<A.length;i++){ if (A[i]>maxAlt){ maxAlt=A[i]; k=i; } }
+
+  const tLaunch = T[0], aLaunch=A[0];
+  const tAp     = T[k], aAp   =A[k];
+  const tLand   = T[T.length-1], aLand=A[A.length-1];
+
+  const flightTime   = Math.max(0, tLand - tLaunch);
+  const timeToApogee = Math.max(0, tAp   - tLaunch);
+  const descentTime  = Math.max(0, tLand - tAp);
+
+  // Avg/Peak ascent
+  const avgAsc = (tAp>tLaunch) ? (aAp - aLaunch)/(tAp - tLaunch) : NaN;
+  let maxAsc = -Infinity;
+  for (let i=1;i<=k;i++){
+    const dt=T[i]-T[i-1]; if (dt<=0) continue;
+    const v=(A[i]-A[i-1])/dt;
+    if (v>maxAsc) maxAsc=v;
+  }
+  if (maxAsc===-Infinity) maxAsc = NaN;
+
+  // Avg/Peak descent (positive magnitudes)
+  const avgDesc = (tLand>tAp) ? (aAp - aLand)/(tLand - tAp) : NaN;
+  let maxDesc = -Infinity;
+  for (let i=k+1;i<T.length;i++){
+    const dt=T[i]-T[i-1]; if (dt<=0) continue;
+    const v=(A[i]-A[i-1])/dt; // negative when descending
+    const mag=-v;
+    if (mag>maxDesc) maxDesc=mag;
+  }
+  if (maxDesc===-Infinity) maxDesc = NaN;
+
+  setMetrics({
+    flightTime, apogee:maxAlt, timeToApogee, descentTime,
+    avgAsc, maxAsc, avgDesc, maxDesc
+  });
+}
+function setMetrics(m){
+  els.m_flightTime.textContent   = m?fmtS(m.flightTime):'—';
+  els.m_apogee.textContent       = m?fmtM(m.apogee):'—';
+  els.m_timeToApogee.textContent = m?fmtS(m.timeToApogee):'—';
+  els.m_descentTime.textContent  = m?fmtS(m.descentTime):'—';
+  els.m_avgAsc.textContent       = m?fmtV(m.avgAsc):'—';
+  els.m_maxAsc.textContent       = m?fmtV(m.maxAsc):'—';
+  els.m_avgDesc.textContent      = m?fmtV(m.avgDesc):'—';
+  els.m_maxDesc.textContent      = m?fmtV(m.maxDesc):'—';
+}
+
+// ------------- Slice / sliders -------------
+function updateSlice(){
+  if (!currentFlight) return;
+  let sp = parseInt(els.startPct.value,10);
+  let ep = parseInt(els.endPct.value,10);
+  if (ep<=sp) ep=Math.min(100,sp+1);
+  els.endPct.value=ep;
+  els.startVal.textContent = sp+'%';
+  els.endVal.textContent   = ep+'%';
+
+  const n = currentFlight.times.length;
+  const i0 = Math.floor(n*(sp/100));
+  const i1 = Math.ceil(n*(ep/100));
+  const visT = currentFlight.times.slice(i0,i1);
+  const visA = currentFlight.alts.slice(i0,i1);
+
+  chart.data.labels = visT;
+  chart.data.datasets[0].data = visA;
+  chart.update();
+
+  const st = visT.length? visT[0] : 0;
+  const et = visT.length? visT[visT.length-1] : 0;
+  els.startTime.textContent = `Start t = ${st.toFixed(2)} s`;
+  els.endTime.textContent   = `End t = ${et.toFixed(2)} s`;
+
+  updateMetricsFromSlice(visT, visA);
+
+  const name = (els.flightName.value||'').trim() || `Flight ${currentFlight.id}`;
+  els.flightNameBadge.textContent = name;
+}
+els.startPct.addEventListener('input', updateSlice);
+els.endPct.addEventListener('input', updateSlice);
+els.flightName.addEventListener('input', ()=> {
+  els.flightNameBadge.textContent = (els.flightName.value||'').trim() || (currentFlight?`Flight ${currentFlight.id}`:'—');
+});
+
+// ------------- CSV -> flights -------------
+function parseCSV(csv){
+  flights=[]; currentFlight=null;
+  const lines = csv.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  const hasMarkers = lines.some(l=>l.startsWith('FLIGHT,'));
+
+  if (!hasMarkers){
+    const f0={id:0,times:[],alts:[]};
+    for (let line of lines){
+      if (line.toLowerCase().includes('time') && line.includes('alt')) continue;
+      const p=line.split(','); if (p.length<2) continue;
+      const t=parseFloat(p[0]), a=parseFloat(p[1]);
+      if (Number.isFinite(t)&&Number.isFinite(a)){ f0.times.push(t); f0.alts.push(a); }
+    }
+    if (f0.times.length) flights.push(f0);
+  } else {
+    for (let line of lines){
+      if (line.startsWith('FLIGHT,')){
+        const n=parseInt(line.split(',')[1]);
+        currentFlight={id:n,times:[],alts:[]};
+        flights.push(currentFlight);
+        continue;
+      }
+      if (line.toLowerCase().includes('time') && line.includes('alt')) continue;
+      const p=line.split(','); if (p.length<2 || !currentFlight) continue;
+      const t=parseFloat(p[0]), a=parseFloat(p[1]);
+      if (Number.isFinite(t)&&Number.isFinite(a)){ currentFlight.times.push(t); currentFlight.alts.push(a); }
+    }
+  }
+
+  els.flightSel.innerHTML = flights.map(f=>`<option value="${f.id}">Flight ${f.id}</option>`).join('');
+  if (flights.length) showFlight(flights[flights.length-1].id);
+}
+function showFlight(id){
+  currentFlight = flights.find(fl=>fl.id==id);
+  els.flightNameBadge.textContent = (els.flightName.value||'').trim() || (currentFlight?`Flight ${currentFlight.id}`:'—');
+  if (!currentFlight) return;
+  els.startPct.value=0; els.endPct.value=100;
+  updateSlice();
+}
+els.flightSel.addEventListener('change', e=>showFlight(e.target.value));
+
+// ------------- Web Serial -------------
+async function connect(){
+  try{
+    port = await navigator.serial.requestPort({});
+    await port.open({ baudRate:115200 });
+    writer = port.writable.getWriter();
+    textDecoder=new TextDecoderStream();
+    readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+    reader = textDecoder.readable.getReader();
+    keepReading=true; readLoop();
+    setConnectedUI(true);
+    await sendLine('STATUS'); // populate memory bar
+  }catch(e){ alert('Failed to connect: '+e); }
+}
+async function disconnect(){
+  try{
+    keepReading=false;
+    if (reader){ await reader.cancel(); await readableStreamClosed.catch(()=>{}); reader=null; }
+    if (writer){ writer.releaseLock(); writer=null; }
+    if (port){ await port.close(); port=null; }
+  }finally{ setConnectedUI(false); }
+}
+async function readLoop(){
+  let collecting=false, buf='';
+  try{
+    while(keepReading){
+      const {value, done} = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      let chunk = value;
+
+      // STATUS bytes
+      const m = chunk.match(/bytes=(\d+)/);
+      if (m){ bytesUsed = parseInt(m[1]); updateMemoryUI(); }
+
+      // CSV frame
+      if (chunk.includes('[BEGIN_CSV]')){
+        collecting=true; buf='';
+        chunk = chunk.slice(chunk.indexOf('[BEGIN_CSV]') + '[BEGIN_CSV]'.length);
+      }
+      if (collecting) buf += chunk;
+      if (chunk.includes('[END_CSV]')){
+        const end = buf.indexOf('[END_CSV]');
+        const csv = buf.slice(0,end).trim().replace(/^\s+/, '');
+        els.txt.value = csv;
+        parseCSV(csv);
+        collecting=false; buf='';
+
+        // refresh bytes after dump
+        await sendLine('STATUS');
+      }
+    }
+  }catch(e){ console.log('Reader stopped:', e); }
+}
+async function sendLine(s){
+  if (!writer) return;
+  const data = new TextEncoder().encode(s+'\n');
+  await writer.write(data);
+}
+
+// ------------- Buttons -------------
 els.connect.onclick = connect;
 els.disconnect.onclick = disconnect;
 els.get.onclick = async ()=> sendLine('DUMP');
-els.clear.onclick = async ()=> sendLine('CLEAR');
-els.statBtn.onclick = async ()=> sendLine('STATUS');
-els.save.onclick = ()=> {
-  const blob = new Blob([els.txt.value], { type: 'text/csv' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
-  a.download = `rp2040_altitude_${stamp}.csv`; a.click();
-  URL.revokeObjectURL(a.href);
+// Confirm before erase
+els.clear.onclick = async ()=> {
+  const ok = confirm('Erase ALL data on the altimeter? This cannot be undone.');
+  if (ok) { await sendLine('CLEAR'); await sendLine('STATUS'); }
 };
-if (!('serial' in navigator)) alert('This browser does not support Web Serial. Use Chrome or Edge.');
+els.statusBtn.onclick = async ()=> sendLine('STATUS');
+
+// ---------- Save XLSX (each flight -> its own sheet) ----------
+els.saveXlsx.onclick = () => {
+  if (!flights.length) { alert('No flights to save!'); return; }
+  const wb = XLSX.utils.book_new();
+  for (let f of flights) {
+    const rows = [['time_s','alt_m']];
+    for (let i=0;i<f.times.length;i++) rows.push([f.times[i], f.alts[i]]);
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws['!freeze'] = { xSplit: 0, ySplit: 1 };
+    ws['!cols'] = [{ wch: 12 }, { wch: 12 }];
+    XLSX.utils.book_append_sheet(wb, ws, `Flight ${f.id}`.substring(0,31));
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+  XLSX.writeFile(wb, `stp_altimeter_${stamp}.xlsx`);
+};
+
+// ---------- Save PDF (chart + metrics, landscape) ----------
+els.savePdf.onclick = async () => {
+  if (!currentFlight) { alert('No flight selected'); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({orientation:'landscape', unit:'pt', format:'a4'});
+  const margin = 36;
+  const pageW  = doc.internal.pageSize.getWidth();
+
+  const title = (els.flightName.value||'').trim() || `Flight ${currentFlight.id}`;
+  doc.setFont('helvetica','bold'); doc.setFontSize(18);
+  doc.text(`STP Altimeter – ${title}`, margin, margin + 6);
+
+  // Chart image
+  const chartCanvas = els.chartCanvas;
+  const chartURL = chartCanvas.toDataURL('image/png', 1.0);
+  const chartW = Math.floor((pageW - margin*3) * 0.65);
+  const chartH = Math.floor(chartW * (chartCanvas.height / chartCanvas.width));
+  doc.addImage(chartURL, 'PNG', margin, margin + 24, chartW, chartH);
+
+  // Metrics image
+  const metrics = document.getElementById('metrics');
+  const metricsCanvas = await html2canvas(metrics, {backgroundColor:'#ffffff', scale:2});
+  const metricsURL = metricsCanvas.toDataURL('image/png', 1.0);
+  const rightX = margin + chartW + margin;
+  const rightW = pageW - rightX - margin;
+  const rightH = rightW * (metricsCanvas.height/metricsCanvas.width);
+  doc.addImage(metricsURL, 'PNG', rightX, margin + 24, rightW, rightH);
+
+  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+  doc.save(`stp_altimeter_${title.replace(/\s+/g,'_')}_${stamp}.pdf`);
+};
+
+// Feature check
+if (!('serial' in navigator)){ alert('This browser does not support Web Serial. Use Chrome or Edge.'); }
+// init
+updateMemoryUI();
 </script>
 </body>
 </html>
