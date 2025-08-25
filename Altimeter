@@ -33,6 +33,9 @@ bool loggingActive = false;
 unsigned long t0 = 0;
 float alt0 = 0.0f;
 static bool lastLogPinState = HIGH;
+static uint32_t nextSampleUs = 0;   // scheduled time of next sample (in microseconds)
+static uint32_t sampleIndex  = 0;   // counts samples (0,1,2,...) → exact 0.05s intervals
+
 
 // We now store the *next* flight id to write.
 // After CLEAR, this resets to 0 so next flight will be FLIGHT,0.
@@ -234,10 +237,9 @@ void setup() {
 }
 
 // ---------- Loop ----------
+// ---------- Loop ----------
 void loop() {
   handleSerial();
-
-  // 0.5 Hz heartbeat
   heartbeatTick();
 
   // Level-controlled logging via D14
@@ -246,7 +248,7 @@ void loop() {
     delay(15); // debounce
     if (digitalRead(LOG_LEVEL_PIN) == logPin) {
       if (logPin == LOW && !loggingActive) {
-        // Start new flight: compute fresh baseline quickly
+        // --- Start new flight ---
         float sum = 0.0f;
         for (int i = 0; i < ZERO_SAMPLES; i++) {
           bmp.takeForcedMeasurement();
@@ -254,17 +256,18 @@ void loop() {
           delay(1);
         }
         alt0 = sum / ZERO_SAMPLES;
-        t0 = millis();
 
-        // Create/append file, write header if empty, then flight marker with current nextFlightId
+        // Reset counters
+        sampleIndex  = 0;
+        nextSampleUs = micros();
+
+        // File prep
         File f = LittleFS.open(CSV_FILE, LittleFS.exists(CSV_FILE) ? "a" : "w");
         if (f) {
           if (f.size() == 0) f.println(F("time_s,alt_m"));
           f.print(F("FLIGHT,"));
           f.println(nextFlightId);
           f.close();
-
-          // Increment and persist the *next* id immediately
           nextFlightId++;
           persistNextFlightId();
         }
@@ -279,21 +282,26 @@ void loop() {
     }
   }
 
-  // Sample at 20 Hz while logging (forced conversions -> faster response)
-  static unsigned long lastSample = 0;
-  if (loggingActive && (millis() - lastSample >= SAMPLE_MS)) {
-    lastSample = millis();
+  // --- Fixed 20 Hz scheduler ---
+  if (loggingActive) {
+    uint32_t nowUs = micros();
+    if ((int32_t)(nowUs - nextSampleUs) >= 0) {
+      // Compute timestamp from index (always exact multiples of 0.05)
+      float t = sampleIndex * 0.05f;
 
-    bmp.takeForcedMeasurement();                     // trigger fresh sample
-    float alt = bmp.readAltitude(SEA_LEVEL_HPA) - alt0;
-    float t   = (millis() - t0) / 1000.0f;
+      bmp.takeForcedMeasurement();
+      float alt = bmp.readAltitude(SEA_LEVEL_HPA) - alt0;
 
-    File f = LittleFS.open(CSV_FILE, "a");
-    if (f) {
-      f.print(t, 2);
-      f.print(',');
-      f.println(alt, 2);
-      f.close();
+      File f = LittleFS.open(CSV_FILE, "a");
+      if (f) {
+        f.print(t, 2);   // will give 0.00, 0.05, 0.10 ...
+        f.print(',');
+        f.println(alt, 2);
+        f.close();
+      }
+
+      sampleIndex++;
+      nextSampleUs += 50000; // 50 ms
     }
   }
 }
