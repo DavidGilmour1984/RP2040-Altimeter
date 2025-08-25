@@ -10,14 +10,21 @@
 #define NEOPIXEL_PIN      16   // Onboard WS2812 on Waveshare RP2040 Zero
 #define NUMPIXELS          1
 
+// --------- Files ---------
+#define CSV_FILE   "/data.csv"
+#define META_FILE  "/meta.txt"   // stores NEXT flight id persistently
+
 // --------- BMP280 ---------
 #define BMP_ADDR         0x76
 #define SEA_LEVEL_HPA    1013.25f
 
 // --------- Logging ---------
 #define SAMPLE_MS     50      // 20 Hz
-#define ZERO_SAMPLES  50
-#define CSV_FILE      "/data.csv"
+#define ZERO_SAMPLES  20      // quicker baseline for responsiveness
+
+// --------- Heartbeat LED (battery saver) ---------
+#define HEARTBEAT_INTERVAL_MS 2000UL   // 0.5 Hz blink (every 2s)
+#define HEARTBEAT_FLASH_MS       40UL  // flash width
 
 Adafruit_BMP280 bmp;
 Adafruit_NeoPixel pixel(NUMPIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -25,52 +32,141 @@ Adafruit_NeoPixel pixel(NUMPIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 bool loggingActive = false;
 unsigned long t0 = 0;
 float alt0 = 0.0f;
-static bool lastLogPinState = HIGH;  
-int flightNumber = 0;  // counts flights since last CLEAR
+static bool lastLogPinState = HIGH;
 
-// ---------- NeoPixel helpers ----------
-void led(uint8_t r, uint8_t g, uint8_t b) {
+// We now store the *next* flight id to write.
+// After CLEAR, this resets to 0 so next flight will be FLIGHT,0.
+int nextFlightId = 0;
+
+// ----- LED mode state machine -----
+enum Mode { MODE_IDLE, MODE_LOGGING, MODE_DUMPING, MODE_CLEARING };
+volatile Mode mode = MODE_IDLE;
+
+unsigned long lastBeat = 0;
+bool beatOn = false;
+unsigned long beatStart = 0;
+
+// ---------- LED helpers ----------
+void led_rgb(uint8_t r, uint8_t g, uint8_t b) {
   pixel.setPixelColor(0, pixel.Color(r, g, b));
   pixel.show();
 }
-void led_idle()  { led(0, 0, 255); }
-void led_log()   { led(0, 255, 0); }
-void led_blink() { led(0, 50, 0); }
-void led_dump()  { led(255, 255, 0); }
-void led_clear() { led(255, 0, 0); }
-void led_error() { led(255, 0, 128); }
+void led_off() { led_rgb(0,0,0); }
+
+void heartbeatTick() {
+  unsigned long now = millis();
+
+  // Start a pulse every interval
+  if (!beatOn && (now - lastBeat >= HEARTBEAT_INTERVAL_MS)) {
+    switch (mode) {
+      case MODE_IDLE:     led_rgb(0,   0, 255); break; // blue
+      case MODE_LOGGING:  led_rgb(0, 255,   0); break; // green
+      case MODE_DUMPING:  led_rgb(255,255,   0); break; // yellow
+      case MODE_CLEARING: led_rgb(255,  0,   0); break; // red
+    }
+    beatOn = true;
+    beatStart = now;
+  }
+
+  // End pulse
+  if (beatOn && (now - beatStart >= HEARTBEAT_FLASH_MS)) {
+    led_off();
+    beatOn = false;
+    lastBeat = now;
+  }
+}
+
+// Immediate one-off flash according to a mode (non-blocking)
+void heartbeatFlashNow(Mode m) {
+  mode = m;
+  lastBeat = millis() - HEARTBEAT_INTERVAL_MS; // force start next tick
+  heartbeatTick();
+}
+
+// ---------- Persistent integer helpers ----------
+int readIntFromFile(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return 0;
+  String s = f.readStringUntil('\n');
+  f.close();
+  s.trim();
+  return s.toInt();
+}
+void writeIntToFile(const char* path, int value) {
+  File f = LittleFS.open(path, "w");
+  if (!f) return;
+  f.println(value);
+  f.close();
+}
+
+// Scan /data.csv for the highest "FLIGHT,n" marker; return -1 if none
+int scanLastFlightFromCSV() {
+  if (!LittleFS.exists(CSV_FILE)) return -1;
+  File f = LittleFS.open(CSV_FILE, "r");
+  if (!f) return -1;
+  int maxFlight = -1;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("FLIGHT,")) {
+      int n = line.substring(7).toInt();
+      if (n > maxFlight) maxFlight = n;
+    }
+  }
+  f.close();
+  return maxFlight;
+}
+
+// Load the *next* flight id: max( meta_next, csv_last+1 ), where no flights -> 0
+void loadNextFlightId() {
+  int metaNext = readIntFromFile(META_FILE);   // stored "next id"
+  int csvLast  = scanLastFlightFromCSV();      // -1 if none
+  int computedNext = (csvLast >= 0) ? (csvLast + 1) : 0;
+  nextFlightId = (metaNext > computedNext) ? metaNext : computedNext;
+}
+void persistNextFlightId() {
+  writeIntToFile(META_FILE, nextFlightId);
+}
 
 // ---------- Serial command handling ----------
 char cmdBuf[32];
 uint8_t cmdLen = 0;
 
 void dumpFile() {
-  if (!LittleFS.exists(CSV_FILE)) {
-    Serial.println(F("[BEGIN_CSV]"));
-    Serial.println(F("time_s,alt_m"));
-    Serial.println(F("[END_CSV]"));
-    return;
-  }
-  File f = LittleFS.open(CSV_FILE, "r");
-  if (!f) return;
+  mode = MODE_DUMPING;
+  heartbeatFlashNow(MODE_DUMPING);
 
-  led_dump();
   Serial.println(F("[BEGIN_CSV]"));
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    Serial.println(line);
+  if (LittleFS.exists(CSV_FILE)) {
+    File f = LittleFS.open(CSV_FILE, "r");
+    if (f) {
+      while (f.available()) {
+        String line = f.readStringUntil('\n');
+        Serial.println(line);
+      }
+      f.close();
+    } else {
+      Serial.println(F("time_s,alt_m"));
+    }
+  } else {
+    Serial.println(F("time_s,alt_m"));
   }
   Serial.println(F("[END_CSV]"));
-  f.close();
-  if (loggingActive) led_log(); else led_idle();
+
+  mode = loggingActive ? MODE_LOGGING : MODE_IDLE;
 }
 
 void clearFile() {
+  mode = MODE_CLEARING;
+  heartbeatFlashNow(MODE_CLEARING);
+
   if (LittleFS.exists(CSV_FILE)) LittleFS.remove(CSV_FILE);
-  flightNumber = 0;
-  led_clear();
-  delay(150);
-  if (loggingActive) led_log(); else led_idle();
+
+  // Reset numbering to zero as requested:
+  nextFlightId = 0;
+  persistNextFlightId();   // store new next id (0)
+
+  mode = loggingActive ? MODE_LOGGING : MODE_IDLE;
 }
 
 void handleSerial() {
@@ -85,16 +181,15 @@ void handleSerial() {
         } else if (!strcasecmp(cmdBuf, "CLEAR")) {
           clearFile();
         } else if (!strcasecmp(cmdBuf, "STATUS")) {
+          size_t bytes = 0;
           if (LittleFS.exists(CSV_FILE)) {
             File f = LittleFS.open(CSV_FILE, "r");
-            Serial.print(F("loggingActive="));
-            Serial.print(loggingActive ? "1" : "0");
-            Serial.print(F(", bytes="));
-            Serial.println(f.size());
-            f.close();
-          } else {
-            Serial.println(F("loggingActive=0, bytes=0"));
+            if (f) { bytes = f.size(); f.close(); }
           }
+          Serial.print(F("loggingActive="));
+          Serial.print(loggingActive ? "1" : "0");
+          Serial.print(F(", bytes=")); Serial.print(bytes);
+          Serial.print(F(", nextFlight=")); Serial.println(nextFlightId);
         } else {
           Serial.println(F("OK CMDS: DUMP | CLEAR | STATUS"));
         }
@@ -109,78 +204,87 @@ void handleSerial() {
 // ---------- Setup ----------
 void setup() {
   pinMode(LOG_LEVEL_PIN, INPUT_PULLUP);
-
   Serial.begin(115200);
 
   pixel.begin();
-  pixel.setBrightness(100);
-  led_idle();
+  pixel.setBrightness(20);   // dim to save battery
+  led_off();
+  mode = MODE_IDLE;
 
-  if (!LittleFS.begin()) {
-    LittleFS.format();
-    LittleFS.begin();
-  }
+  if (!LittleFS.begin()) { LittleFS.format(); LittleFS.begin(); }
+  loadNextFlightId();
 
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
   Wire.begin();
 
-  if (!bmp.begin(BMP_ADDR)) {
-    led_error();
-    delay(400);
-    led_idle();
+  if (bmp.begin(BMP_ADDR)) {
+    // Fast, responsive config: FORCED mode, minimal oversampling, no IIR filter
+    bmp.setSampling(Adafruit_BMP280::MODE_FORCED,
+                    Adafruit_BMP280::SAMPLING_X1,   // temperature
+                    Adafruit_BMP280::SAMPLING_X4,   // pressure (light oversampling)
+                    Adafruit_BMP280::FILTER_OFF,    // fastest response
+                    Adafruit_BMP280::STANDBY_MS_63);// ignored in FORCED
   } else {
-    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                    Adafruit_BMP280::SAMPLING_X2,
-                    Adafruit_BMP280::SAMPLING_X16,
-                    Adafruit_BMP280::FILTER_X16,
-                    Adafruit_BMP280::STANDBY_MS_63);
+    // Sensor absent; heartbeat will still blink in idle
   }
 
   lastLogPinState = digitalRead(LOG_LEVEL_PIN);
+  lastBeat = millis();
 }
 
 // ---------- Loop ----------
 void loop() {
   handleSerial();
 
+  // 0.5 Hz heartbeat
+  heartbeatTick();
+
+  // Level-controlled logging via D14
   bool logPin = digitalRead(LOG_LEVEL_PIN);
   if (logPin != lastLogPinState) {
-    delay(20);
+    delay(15); // debounce
     if (digitalRead(LOG_LEVEL_PIN) == logPin) {
       if (logPin == LOW && !loggingActive) {
-        // Start new flight
+        // Start new flight: compute fresh baseline quickly
         float sum = 0.0f;
         for (int i = 0; i < ZERO_SAMPLES; i++) {
+          bmp.takeForcedMeasurement();
           sum += bmp.readAltitude(SEA_LEVEL_HPA);
-          delay(2);
+          delay(1);
         }
         alt0 = sum / ZERO_SAMPLES;
         t0 = millis();
 
+        // Create/append file, write header if empty, then flight marker with current nextFlightId
         File f = LittleFS.open(CSV_FILE, LittleFS.exists(CSV_FILE) ? "a" : "w");
         if (f) {
           if (f.size() == 0) f.println(F("time_s,alt_m"));
-          flightNumber++;
           f.print(F("FLIGHT,"));
-          f.println(flightNumber);
+          f.println(nextFlightId);
           f.close();
+
+          // Increment and persist the *next* id immediately
+          nextFlightId++;
+          persistNextFlightId();
         }
 
         loggingActive = true;
-        led_log();
+        mode = MODE_LOGGING;
       } else if (logPin == HIGH && loggingActive) {
         loggingActive = false;
-        led_idle();
+        mode = MODE_IDLE;
       }
       lastLogPinState = logPin;
     }
   }
 
-  // Sample while logging
+  // Sample at 20 Hz while logging (forced conversions -> faster response)
   static unsigned long lastSample = 0;
   if (loggingActive && (millis() - lastSample >= SAMPLE_MS)) {
     lastSample = millis();
+
+    bmp.takeForcedMeasurement();                     // trigger fresh sample
     float alt = bmp.readAltitude(SEA_LEVEL_HPA) - alt0;
     float t   = (millis() - t0) / 1000.0f;
 
@@ -191,9 +295,5 @@ void loop() {
       f.println(alt, 2);
       f.close();
     }
-
-    led_blink();
-    delay(3);
-    led_log();
   }
 }
